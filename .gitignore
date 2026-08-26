@@ -1,0 +1,25 @@
+cat << 'EOF' > .gitignore
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+
+# Datasets and large media
+data/
+*.zip
+*.tar.gz
+*.tar
+
+# Model checkpoints & weights
+checkpoints/
+*.pt
+*.pth
+*.onnx
+
+# Tracking and IDE
+wandb/
+.vscode/
+.ipynb_checkpoints/
+EOF
