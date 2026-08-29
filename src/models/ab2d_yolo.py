@@ -259,20 +259,3 @@ if __name__ == "__main__":
     print(f"Total scales: {len(outputs)}")
     for i, out in enumerate(outputs):
         print(f"Scale {i} shape: {out.shape}")
-
-"""
-Note: During training process. scale_ranges for this specific model must be set to:
-
-scale_ranges_4scale = [
-    (0.0, 0.05),   # P2 Grid (160x160): Sub-pixel / tiny drone targets (< 32px)
-    (0.04, 0.12),  # P3 Grid (80x80): Small drones
-    (0.10, 0.28),  # P4 Grid (40x40): Medium drones
-    (0.25, 1.00)   # P5 Grid (20x20): Large / nearby drones
-]
-
-criterion = DetectionLoss(
-    loss_type="iciou",
-    scale_ranges=scale_ranges_4scale
-)
-
-"""

@@ -88,7 +88,7 @@ def get_train_transforms(img_size: int = 640) -> A.Compose:
             # Specifically for the city images since edges of the buildings can be similar to the drone edges
             A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=20, val_shift_limit=15, p=0.3),
             
-            # 5. Normalization based on Mean and STD values of ImageNet-1k Dataset
+            # Normalization based on Mean and STD values of ImageNet-1k Dataset
             A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
 
             # Convert the image to a PyTorch tensor
