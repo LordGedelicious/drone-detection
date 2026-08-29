@@ -119,8 +119,9 @@ class SingleGPUTrainer:
 
                 comb_boxes = torch.cat(all_boxes, dim=0)
                 comb_confs = torch.cat(all_confs, dim=0)
-                self.evaluator.update(comb_boxes, comb_confs, tgt_boxes)
-
+                # Reduce probability of GPU OOM issues
+                self.evaluator.update(comb_boxes.detach().cpu(), comb_confs.detach().cpu(), tgt_boxes.detach().cpu())
+        
         metrics = self.evaluator.compute_metrics()
         metrics["val/total_loss"] = val_loss / len(self.val_loader)
         return metrics
