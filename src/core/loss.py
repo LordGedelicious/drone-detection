@@ -1,0 +1,327 @@
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha: float = 0.25, gamma: float = 2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        p = torch.sigmoid(logits)
+        ce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        p_t = p * targets + (1 - p) * (1 - targets)
+        alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+        loss = alpha_t * ((1 - p_t) ** self.gamma) * ce_loss
+        return loss.mean()
+
+
+def bbox_iou(box1: torch.Tensor, box2: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    """
+    Computes Standard Intersection over Union (IoU) between boxes formatted as (x_c, y_c, w, h).
+    Loss is calculated as: 1.0 - bbox_iou(...)
+    """
+    b1_x1, b1_x2 = box1[..., 0] - box1[..., 2] / 2, box1[..., 0] + box1[..., 2] / 2
+    b1_y1, b1_y2 = box1[..., 1] - box1[..., 3] / 2, box1[..., 1] + box1[..., 3] / 2
+    b2_x1, b2_x2 = box2[..., 0] - box2[..., 2] / 2, box2[..., 0] + box2[..., 2] / 2
+    b2_y1, b2_y2 = box2[..., 1] - box2[..., 3] / 2, box2[..., 1] + box2[..., 3] / 2
+
+    # Intersection area
+    inter_w = (torch.min(b1_x2, b2_x2) - torch.max(b1_x1, b2_x1)).clamp(0)
+    inter_h = (torch.min(b1_y2, b2_y2) - torch.max(b1_y1, b2_y1)).clamp(0)
+    inter = inter_w * inter_h
+
+    # Union area
+    w1, h1 = box1[..., 2], box1[..., 3]
+    w2, h2 = box2[..., 2], box2[..., 3]
+    union = w1 * h1 + w2 * h2 - inter + eps
+
+    iou = inter / union
+    return iou.clamp(0.0, 1.0)
+
+def bbox_iciou(box1: torch.Tensor, box2: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    """
+    Computes Improved Complete IoU (ICIoU) between boxes formatted as (x_c, y_c, w, h).
+    Reference: ICIoU (https://ieeexplore.ieee.org/document/9497076).
+    """
+    b1_x1, b1_x2 = box1[..., 0] - box1[..., 2] / 2, box1[..., 0] + box1[..., 2] / 2
+    b1_y1, b1_y2 = box1[..., 1] - box1[..., 3] / 2, box1[..., 1] + box1[..., 3] / 2
+    b2_x1, b2_x2 = box2[..., 0] - box2[..., 2] / 2, box2[..., 0] + box2[..., 2] / 2
+    b2_y1, b2_y2 = box2[..., 1] - box2[..., 3] / 2, box2[..., 1] + box2[..., 3] / 2
+
+    # Intersection area
+    inter_w = (torch.min(b1_x2, b2_x2) - torch.max(b1_x1, b2_x1)).clamp(0)
+    inter_h = (torch.min(b1_y2, b2_y2) - torch.max(b1_y1, b2_y1)).clamp(0)
+    inter = inter_w * inter_h
+
+    # Union area
+    w1, h1 = box1[..., 2], box1[..., 3]
+    w2, h2 = box2[..., 2], box2[..., 3]
+    union = w1 * h1 + w2 * h2 - inter + eps
+    iou = inter / union
+
+    # Smallest enclosing box
+    cw = torch.max(b1_x2, b2_x2) - torch.min(b1_x1, b2_x1)
+    ch = torch.max(b1_y2, b2_y2) - torch.min(b1_y1, b2_y1)
+    c2 = cw ** 2 + ch ** 2 + eps
+
+    # Center point euclidean distance squared
+    rho2 = ((box1[..., 0] - box2[..., 0]) ** 2) + ((box1[..., 1] - box2[..., 1]) ** 2)
+
+    # Addition from paper: CIoU Aspect Ratio Term
+    v = (4 / (math.pi ** 2)) * torch.pow(torch.atan(w2 / (h2 + eps)) - torch.atan(w1 / (h1 + eps)), 2)
+    with torch.no_grad():
+        alpha = v / (1 - iou + v + eps)
+
+    # Addition from paper: ICIoU Angle & Scale Regularization Term (Diagonal orientation deviation)
+    theta1 = torch.atan(h1 / (w1 + eps))
+    theta2 = torch.atan(h2 / (w2 + eps))
+    delta_theta = (4 / (math.pi ** 2)) * torch.pow(theta1 - theta2, 2)
+    
+    with torch.no_grad():
+        gamma = delta_theta / (1 - iou + delta_theta + eps)
+
+    # Combine CIoU center & aspect terms with the angle-guided regularization
+    iciou = iou - (rho2 / c2 + alpha * v + gamma * delta_theta)
+    return iciou.clamp(-1.0, 1.0)
+
+def bbox_ciou(box1: torch.Tensor, box2: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    """
+    Normal Complete IoU (CIoU) between boxes formatted as (x_c, y_c, w, h).
+    """
+    b1_x1, b1_x2 = box1[..., 0] - box1[..., 2] / 2, box1[..., 0] + box1[..., 2] / 2
+    b1_y1, b1_y2 = box1[..., 1] - box1[..., 3] / 2, box1[..., 1] + box1[..., 3] / 2
+    b2_x1, b2_x2 = box2[..., 0] - box2[..., 2] / 2, box2[..., 0] + box2[..., 2] / 2
+    b2_y1, b2_y2 = box2[..., 1] - box2[..., 3] / 2, box2[..., 1] + box2[..., 3] / 2
+
+    # Intersection area
+    inter = (torch.min(b1_x2, b2_x2) - torch.max(b1_x1, b2_x1)).clamp(0) * \
+            (torch.min(b1_y2, b2_y2) - torch.max(b1_y1, b2_y1)).clamp(0)
+
+    # Union area
+    w1, h1 = box1[..., 2], box1[..., 3]
+    w2, h2 = box2[..., 2], box2[..., 3]
+    union = w1 * h1 + w2 * h2 - inter + eps
+    iou = inter / union
+
+    # Smallest enclosing box
+    cw = torch.max(b1_x2, b2_x2) - torch.min(b1_x1, b2_x1)
+    ch = torch.max(b1_y2, b2_y2) - torch.min(b1_y1, b2_y1)
+    c2 = cw ** 2 + ch ** 2 + eps
+
+    # Center distance squared
+    rho2 = ((box1[..., 0] - box2[..., 0]) ** 2) + ((box1[..., 1] - box2[..., 1]) ** 2)
+
+    # Aspect ratio consistency
+    v = (4 / (math.pi ** 2)) * torch.pow(torch.atan(w2 / (h2 + eps)) - torch.atan(w1 / (h1 + eps)), 2)
+    with torch.no_grad():
+        alpha = v / (1 - iou + v + eps)
+
+    ciou = iou - (rho2 / c2 + v * alpha)
+    return ciou.clamp(-1.0, 1.0)
+
+def bbox_eiou(box1: torch.Tensor, box2: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    """
+    Efficient IoU (EIoU) Loss.
+    Separates aspect ratio penalty into explicit width and height normalized differences.
+    Boxes formatted as (x_c, y_c, w, h).
+    """
+    b1_x1, b1_x2 = box1[..., 0] - box1[..., 2] / 2, box1[..., 0] + box1[..., 2] / 2
+    b1_y1, b1_y2 = box1[..., 1] - box1[..., 3] / 2, box1[..., 1] + box1[..., 3] / 2
+    b2_x1, b2_x2 = box2[..., 0] - box2[..., 2] / 2, box2[..., 0] + box2[..., 2] / 2
+    b2_y1, b2_y2 = box2[..., 1] - box2[..., 3] / 2, box2[..., 1] + box2[..., 3] / 2
+
+    # Intersection area
+    inter_w = (torch.min(b1_x2, b2_x2) - torch.max(b1_x1, b2_x1)).clamp(0)
+    inter_h = (torch.min(b1_y2, b2_y2) - torch.max(b1_y1, b2_y1)).clamp(0)
+    inter = inter_w * inter_h
+
+    # Union area
+    w1, h1 = box1[..., 2], box1[..., 3]
+    w2, h2 = box2[..., 2], box2[..., 3]
+    union = w1 * h1 + w2 * h2 - inter + eps
+    iou = inter / union
+
+    # Smallest enclosing box
+    cw = torch.max(b1_x2, b2_x2) - torch.min(b1_x1, b2_x1)
+    ch = torch.max(b1_y2, b2_y2) - torch.min(b1_y1, b2_y1)
+    c2 = cw ** 2 + ch ** 2 + eps
+
+    # Center distance squared
+    rho2_center = ((box1[..., 0] - box2[..., 0]) ** 2) + ((box1[..., 1] - box2[..., 1]) ** 2)
+
+    # Explicit width & height discrepancy squared
+    rho2_w = (w1 - w2) ** 2
+    rho2_h = (h1 - h2) ** 2
+
+    cw2 = cw ** 2 + eps
+    ch2 = ch ** 2 + eps
+
+    # EIoU formula: IoU - (distance_cost + width_cost + height_cost)
+    eiou = iou - (rho2_center / c2 + rho2_w / cw2 + rho2_h / ch2)
+    return eiou.clamp(-1.0, 1.0)
+
+def bbox_siou(box1: torch.Tensor, box2: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    """
+    Scylla IoU (SIoU) Loss.
+    Combines Angle, Distance, Shape, and IoU costs to align box trajectories.
+    Boxes formatted as (x_c, y_c, w, h).
+    """
+    b1_x1, b1_x2 = box1[..., 0] - box1[..., 2] / 2, box1[..., 0] + box1[..., 2] / 2
+    b1_y1, b1_y2 = box1[..., 1] - box1[..., 3] / 2, box1[..., 1] + box1[..., 3] / 2
+    b2_x1, b2_x2 = box2[..., 0] - box2[..., 2] / 2, box2[..., 0] + box2[..., 2] / 2
+    b2_y1, b2_y2 = box2[..., 1] - box2[..., 3] / 2, box2[..., 1] + box2[..., 3] / 2
+
+    # Intersection area
+    inter_w = (torch.min(b1_x2, b2_x2) - torch.max(b1_x1, b2_x1)).clamp(0)
+    inter_h = (torch.min(b1_y2, b2_y2) - torch.max(b1_y1, b2_y1)).clamp(0)
+    inter = inter_w * inter_h
+
+    # Union area
+    w1, h1 = box1[..., 2], box1[..., 3]
+    w2, h2 = box2[..., 2], box2[..., 3]
+    union = w1 * h1 + w2 * h2 - inter + eps
+    iou = inter / union
+
+    # Smallest enclosing box
+    cw = torch.max(b1_x2, b2_x2) - torch.min(b1_x1, b2_x1)
+    ch = torch.max(b1_y2, b2_y2) - torch.min(b1_y1, b2_y1)
+
+    # Center offsets
+    s_cw = (box2[..., 0] - box1[..., 0])
+    s_ch = (box2[..., 1] - box1[..., 1])
+    sigma = torch.sqrt(s_cw ** 2 + s_ch ** 2 + eps)
+
+    # 1. Angle Cost
+    sin_alpha = torch.abs(s_ch) / sigma
+    sin_beta = torch.abs(s_cw) / sigma
+    sin_alpha = torch.where(sin_alpha > math.sin(math.pi / 4), sin_beta, sin_alpha)
+    safe_sin_alpha = sin_alpha.clamp(-1.0 + 1e-4, 1.0 - 1e-4) # If sin_alpha is exactly 1.0, arcsin will return NaN and the gradient will be infinite. Hence, this safeguard.
+    angle_cost = 1.0 - 2.0 * torch.pow(torch.sin(torch.arcsin(safe_sin_alpha) - (math.pi / 4)), 2)
+
+    # 2. Distance Cost
+    gamma = 2.0 - angle_cost
+    rho_x = ((s_cw / (cw + eps)) ** 2)
+    rho_y = ((s_ch / (ch + eps)) ** 2)
+    dist_cost = 2.0 - torch.exp(-gamma * rho_x) - torch.exp(-gamma * rho_y)
+
+    # 3. Shape Cost
+    omega_w = torch.abs(w1 - w2) / (torch.max(w1, w2) + eps)
+    omega_h = torch.abs(h1 - h2) / (torch.max(h1, h2) + eps)
+    shape_cost = torch.pow(1.0 - torch.exp(-omega_w), 4) + torch.pow(1.0 - torch.exp(-omega_h), 4)
+
+    # SIoU formula
+    siou = iou - (dist_cost + shape_cost) * 0.5
+    return siou.clamp(-1.0, 1.0)
+
+# Detection loss class that combines focal Loss for classification and IoU-based loss for bounding box regression
+# Standard detection loss fail because a model can be overly confident about the presence of an object 
+# but still predict a poor bounding box, leading to high classification confidence but low localization accuracy. 
+# Hence, detection loss here adds focal loss so actual drone pixels won't get muted during training due to class imbalance.
+class DetectionLoss(nn.Module):
+    def __init__(
+        self,
+        alpha: float = 0.25,
+        gamma: float = 2.0,
+        lambda_box: float = 2.0,
+        lambda_cls: float = 1.0,
+        loss_type: str = "iciou",
+        # Area/size thresholds in normalized image coordinates (0.0 to 1.0)
+        # Defines min/max max-edge bounds for each scale level (fine to coarse)
+        scale_ranges: list = None
+    ):
+        super().__init__()
+        self.focal_loss = FocalLoss(alpha=alpha, gamma=gamma)
+        self.lambda_box = lambda_box
+        self.lambda_cls = lambda_cls
+        self.loss_type = loss_type.lower()
+        
+        # Default 3-scale bounds: [P3/fine: 0 to 0.1, P4/mid: 0.08 to 0.25, P5/coarse: 0.2 to 1.0]
+        # Adding this in case there's 2 drone with similar tensor sizes so they won't overwrite their target assignments in the same scale level.
+        self.scale_ranges = scale_ranges or [
+            (0.0, 0.10),   # Fine grid (e.g., 80x80): small drones
+            (0.08, 0.25),  # Mid grid (e.g., 40x40): medium drones
+            (0.20, 1.00)   # Coarse grid (e.g., 20x20): large drones
+        ]
+
+    def forward(self, pred_head_outputs: list, targets: list):
+        device = pred_head_outputs[0].device
+        batch_size = len(targets)
+        total_cls_loss = torch.tensor(0.0, device=device)
+        total_box_loss = torch.tensor(0.0, device=device)
+        num_scales = len(pred_head_outputs)
+
+        # Sort feature maps from finest (largest spatial dim) to coarsest
+        for scale_idx, preds in enumerate(pred_head_outputs):
+            B, H, W, C = preds.shape
+
+            target_obj = torch.zeros((B, H, W), device=device)
+            target_boxes = torch.zeros((B, H, W, 4), device=device)
+            pos_mask = torch.zeros((B, H, W), dtype=torch.bool, device=device)
+
+            # Get target size range for this pyramid scale if configured
+            min_size, max_size = (
+                self.scale_ranges[scale_idx] if scale_idx < len(self.scale_ranges) else (0.0, 1.0)
+            )
+
+            for b in range(batch_size):
+                boxes = targets[b]["boxes"].to(device)
+                if boxes.shape[0] == 0:
+                    continue
+
+                # Filter boxes by size for the current pyramid level
+                max_edge = torch.max(boxes[:, 2], boxes[:, 3])
+                scale_keep = (max_edge >= min_size) & (max_edge <= max_size)
+                filtered_boxes = boxes[scale_keep]
+
+                if filtered_boxes.shape[0] == 0:
+                    continue
+
+                gx = (filtered_boxes[:, 0] * W).long().clamp(0, W - 1)
+                gy = (filtered_boxes[:, 1] * H).long().clamp(0, H - 1)
+
+                # Assign only the scale-relevant boxes
+                for i in range(len(filtered_boxes)):
+                    x_c, y_c = gx[i], gy[i]
+                    target_obj[b, y_c, x_c] = 1.0
+                    target_boxes[b, y_c, x_c] = filtered_boxes[i]
+                    pos_mask[b, y_c, x_c] = True
+
+            total_cls_loss += self.focal_loss(preds[..., 4], target_obj)
+
+            if pos_mask.sum() > 0:
+                b_idx, y_idx, x_idx = torch.nonzero(pos_mask, as_tuple=True)
+                pred_pos_raw = preds[pos_mask][..., :4]
+                target_pos = target_boxes[pos_mask]
+
+                px = (torch.sigmoid(pred_pos_raw[:, 0]) + x_idx.float()) / W
+                py = (torch.sigmoid(pred_pos_raw[:, 1]) + y_idx.float()) / H
+                pw = torch.exp(pred_pos_raw[:, 2]) / W
+                ph = torch.exp(pred_pos_raw[:, 3]) / H
+                pred_boxes = torch.stack([px, py, pw, ph], dim=-1)
+
+                if self.loss_type == "eiou":
+                    iou_loss = 1.0 - bbox_eiou(pred_boxes, target_pos)
+                elif self.loss_type == "siou":
+                    iou_loss = 1.0 - bbox_siou(pred_boxes, target_pos)
+                elif self.loss_type == "ciou":
+                    iou_loss = 1.0 - bbox_ciou(pred_boxes, target_pos)
+                elif self.loss_type == "iciou":
+                    iou_loss = 1.0 - bbox_iciou(pred_boxes, target_pos)
+                else:
+                    iou_loss = 1.0 - bbox_iou(pred_boxes, target_pos)
+
+                total_box_loss += iou_loss.mean()
+
+        total_loss = (self.lambda_cls * (total_cls_loss / num_scales)) + (
+            self.lambda_box * (total_box_loss / num_scales)
+        )
+
+        return total_loss, {
+            "loss/total": total_loss.item(),
+            "loss/cls": (total_cls_loss / num_scales).item(),
+            "loss/box": (total_box_loss / num_scales).item(),
+        }
