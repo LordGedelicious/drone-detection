@@ -56,8 +56,27 @@ def main():
     train_dataset = Subset(DroneDataset(args.img_dir, args.lbl_dir, transforms=get_train_transforms(640)), train_idx)
     val_dataset = Subset(DroneDataset(args.img_dir, args.lbl_dir, transforms=get_val_transforms(640)), val_idx)
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=args.batch_size, 
+        shuffle=True, 
+        collate_fn=collate_fn, 
+        num_workers=12,
+        persistent_workers=True,
+        prefetch_factor=2,
+        pin_memory=True
+    )
+
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=args.batch_size, 
+        shuffle=False, 
+        collate_fn=collate_fn, 
+        num_workers=4,
+        persistent_workers=True,
+        prefetch_factor=2,
+        pin_memory=True
+    )
 
     # 3. Dynamic Model & Loss Configuration
     if args.model == "baseline":
@@ -88,7 +107,8 @@ def main():
         optimizer=optimizer,
         lr_scheduler=torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs),
         tracker=tracker,
-        model_name=args.model
+        model_name=args.model,
+        device="cuda"  # Add this line to force GPU usage
     )
     
     trainer.fit(epochs=args.epochs)

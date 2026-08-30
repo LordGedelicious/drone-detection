@@ -5,18 +5,20 @@ import torch.nn.functional as F
 
 
 class FocalLoss(nn.Module):
-    def __init__(self, alpha: float = 0.25, gamma: float = 2.0):
+    def __init__(self, alpha: float = 0.75, gamma: float = 2.0):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
 
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor, num_pos: int = 1) -> torch.Tensor:
         p = torch.sigmoid(logits)
         ce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
         p_t = p * targets + (1 - p) * (1 - targets)
         alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
-        loss = alpha_t * ((1 - p_t) ** self.gamma) * ce_loss
-        return loss.mean()
+        focal_weight = alpha_t * ((1 - p_t) ** self.gamma)
+        loss = focal_weight * ce_loss
+        # Sum all cells and normalize ONLY by the count of positive drone targets
+        return loss.sum() / max(num_pos, 1)
 
 
 def bbox_iou(box1: torch.Tensor, box2: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
@@ -224,13 +226,11 @@ def bbox_siou(box1: torch.Tensor, box2: torch.Tensor, eps: float = 1e-7) -> torc
 class DetectionLoss(nn.Module):
     def __init__(
         self,
-        alpha: float = 0.25,
+        alpha: float = 0.75,
         gamma: float = 2.0,
         lambda_box: float = 2.0,
         lambda_cls: float = 1.0,
         loss_type: str = "iciou",
-        # Area/size thresholds in normalized image coordinates (0.0 to 1.0)
-        # Defines min/max max-edge bounds for each scale level (fine to coarse)
         scale_ranges: list = None
     ):
         super().__init__()
@@ -238,13 +238,10 @@ class DetectionLoss(nn.Module):
         self.lambda_box = lambda_box
         self.lambda_cls = lambda_cls
         self.loss_type = loss_type.lower()
-        
-        # Default 3-scale bounds: [P3/fine: 0 to 0.1, P4/mid: 0.08 to 0.25, P5/coarse: 0.2 to 1.0]
-        # Adding this in case there's 2 drone with similar tensor sizes so they won't overwrite their target assignments in the same scale level.
         self.scale_ranges = scale_ranges or [
-            (0.0, 0.10),   # Fine grid (e.g., 80x80): small drones
-            (0.08, 0.25),  # Mid grid (e.g., 40x40): medium drones
-            (0.20, 1.00)   # Coarse grid (e.g., 20x20): large drones
+            (0.0, 0.10),
+            (0.08, 0.25),
+            (0.20, 1.00)
         ]
 
     def forward(self, pred_head_outputs: list, targets: list):
@@ -254,15 +251,15 @@ class DetectionLoss(nn.Module):
         total_box_loss = torch.tensor(0.0, device=device)
         num_scales = len(pred_head_outputs)
 
-        # Sort feature maps from finest (largest spatial dim) to coarsest
+        # Count total positive drones in this batch
+        total_pos_count = sum(t["boxes"].shape[0] for t in targets)
+
         for scale_idx, preds in enumerate(pred_head_outputs):
             B, H, W, C = preds.shape
-
             target_obj = torch.zeros((B, H, W), device=device)
             target_boxes = torch.zeros((B, H, W, 4), device=device)
             pos_mask = torch.zeros((B, H, W), dtype=torch.bool, device=device)
 
-            # Get target size range for this pyramid scale if configured
             min_size, max_size = (
                 self.scale_ranges[scale_idx] if scale_idx < len(self.scale_ranges) else (0.0, 1.0)
             )
@@ -272,25 +269,22 @@ class DetectionLoss(nn.Module):
                 if boxes.shape[0] == 0:
                     continue
 
-                # Filter boxes by size for the current pyramid level
                 max_edge = torch.max(boxes[:, 2], boxes[:, 3])
                 scale_keep = (max_edge >= min_size) & (max_edge <= max_size)
                 filtered_boxes = boxes[scale_keep]
-
                 if filtered_boxes.shape[0] == 0:
                     continue
 
                 gx = (filtered_boxes[:, 0] * W).long().clamp(0, W - 1)
                 gy = (filtered_boxes[:, 1] * H).long().clamp(0, H - 1)
 
-                # Assign only the scale-relevant boxes
                 for i in range(len(filtered_boxes)):
                     x_c, y_c = gx[i], gy[i]
                     target_obj[b, y_c, x_c] = 1.0
                     target_boxes[b, y_c, x_c] = filtered_boxes[i]
                     pos_mask[b, y_c, x_c] = True
 
-            total_cls_loss += self.focal_loss(preds[..., 4], target_obj)
+            total_cls_loss += self.focal_loss(preds[..., 4], target_obj, num_pos=total_pos_count)
 
             if pos_mask.sum() > 0:
                 b_idx, y_idx, x_idx = torch.nonzero(pos_mask, as_tuple=True)
@@ -314,7 +308,7 @@ class DetectionLoss(nn.Module):
                 else:
                     iou_loss = 1.0 - bbox_iou(pred_boxes, target_pos)
 
-                total_box_loss += iou_loss.mean()
+                total_box_loss += iou_loss.sum() / max(total_pos_count, 1)
 
         total_loss = (self.lambda_cls * (total_cls_loss / num_scales)) + (
             self.lambda_box * (total_box_loss / num_scales)

@@ -1,0 +1,7 @@
+albumentations==2.0.8
+numpy==2.5.2
+torch==2.8.0+cu128
+torchvision==0.23.0+cu128
+tqdm==4.70.0
+wandb==0.29.0
+gdown
