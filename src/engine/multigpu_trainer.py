@@ -5,6 +5,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+import torchvision
 from tqdm import tqdm
 from src.core.metrics import MetricEvaluator
 from src.engine.wnb_tracker import WandbTracker
@@ -45,7 +46,7 @@ class MultiGPUTrainer:
         self.model_name = model_name
 
         self.scaler = torch.amp.GradScaler("cuda")
-        self.evaluator = MetricEvaluator(conf_threshold=0.25)
+        self.evaluator = MetricEvaluator(conf_threshold=0.001)
         self.best_mAP = 0.0
 
     def train_epoch(self, epoch: int) -> dict:
@@ -128,6 +129,27 @@ class MultiGPUTrainer:
 
                     comb_boxes = torch.cat(all_boxes, dim=0)
                     comb_confs = torch.cat(all_confs, dim=0)
+
+                    # 1. Pre-filter ultra-low confidences to speed up NMS computation
+                    valid_mask = comb_confs > 0.001
+                    comb_boxes = comb_boxes[valid_mask]
+                    comb_confs = comb_confs[valid_mask]
+
+                    # 2. Apply Non-Maximum Suppression (NMS)
+                    if comb_boxes.shape[0] > 0:
+                        # NMS requires boxes in (x1, y1, x2, y2) format
+                        xyxy_boxes = torch.zeros_like(comb_boxes)
+                        xyxy_boxes[:, 0] = comb_boxes[:, 0] - comb_boxes[:, 2] / 2
+                        xyxy_boxes[:, 1] = comb_boxes[:, 1] - comb_boxes[:, 3] / 2
+                        xyxy_boxes[:, 2] = comb_boxes[:, 0] + comb_boxes[:, 2] / 2
+                        xyxy_boxes[:, 3] = comb_boxes[:, 1] + comb_boxes[:, 3] / 2
+                        
+                        # Suppress overlapping boxes with IoU > 0.45
+                        keep_idx = torchvision.ops.nms(xyxy_boxes, comb_confs, iou_threshold=0.45)
+                        
+                        comb_boxes = comb_boxes[keep_idx]
+                        comb_confs = comb_confs[keep_idx]
+
                     # Reduce probability of GPU OOM issues
                     self.evaluator.update(comb_boxes.detach().cpu(), comb_confs.detach().cpu(), tgt_boxes.detach().cpu())
 

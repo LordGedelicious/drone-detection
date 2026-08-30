@@ -67,9 +67,19 @@ def collate_fn(batch):
 def get_train_transforms(img_size: int = 640) -> A.Compose:
     return A.Compose(
         [
+            # Scale longest edge to 640, keeping aspect ratio (results in 640x360)
+            # Then pad out the remaining height with black borders to hit 640x640
+            # If too small, probably need to adjust the img_size to 960 probably
+            A.LongestMaxSize(max_size=img_size),
+            A.PadIfNeeded(
+                min_height=img_size, 
+                min_width=img_size, 
+                border_mode=cv2.BORDER_CONSTANT, 
+                value=(0, 0, 0)
+            ),
+
             # Basic geometric transformations + shift, scale, rotate since the drones 
             # appear in many orientations and positions in the sampled images
-            A.Resize(img_size, img_size),
             A.HorizontalFlip(p=0.5),
             A.ShiftScaleRotate(
                 shift_limit=0.05,
@@ -106,7 +116,16 @@ def get_val_transforms(img_size: int = 640) -> A.Compose:
     return A.Compose(
         [
             # Reproduce transformations for validation without the augmentations
-            A.Resize(img_size, img_size),
+            # Scale longest edge to 640, keeping aspect ratio (results in 640x360)
+            # Then pad out the remaining height with black borders to hit 640x640
+            # If too small, probably need to adjust the img_size to 960 probably
+            A.LongestMaxSize(max_size=img_size),
+            A.PadIfNeeded(
+                min_height=img_size, 
+                min_width=img_size, 
+                border_mode=cv2.BORDER_CONSTANT, 
+                value=(0, 0, 0)
+            ),
             A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
             ToTensorV2(),
         ],
