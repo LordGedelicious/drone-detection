@@ -2,9 +2,10 @@ import os
 import shutil
 from pathlib import Path
 
-RAW_DIR = Path("../data/extracted_raw")
-IMG_DIR = Path("../data/images")
-LBL_DIR = Path("../data/labels")
+BASE_DIR = Path(__file__).resolve().parent
+RAW_DIR = BASE_DIR / "extracted_raw/curated_datasets/obj_det_base"
+IMG_DIR = BASE_DIR / "images"
+LBL_DIR = BASE_DIR / "labels"
 
 IMG_DIR.mkdir(parents=True, exist_ok=True)
 LBL_DIR.mkdir(parents=True, exist_ok=True)
