@@ -1,7 +1,19 @@
-albumentations==2.0.8
-numpy==2.5.2
+# Runtime dependencies for the from-scratch drone detector.
+# Pins match the RunPod pod the models were trained on (CUDA 12.8, driver 570).
+# Install:  pip install -r requirements-final.txt
+--extra-index-url https://download.pytorch.org/whl/cu128
+
 torch==2.8.0+cu128
 torchvision==0.23.0+cu128
+numpy==2.5.2
+albumentations==2.0.8
+opencv-python-headless==5.0.0.93
 tqdm==4.70.0
 wandb==0.29.0
+pillow==11.0.0
+
+# dataset download helper (data/ is fetched separately, not in git)
 gdown
+
+# If you want to compare with YOLOv26, install ultralytics as well
+ultralytics

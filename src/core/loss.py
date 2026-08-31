@@ -231,13 +231,20 @@ class DetectionLoss(nn.Module):
         lambda_box: float = 2.0,
         lambda_cls: float = 1.0,
         loss_type: str = "iciou",
-        scale_ranges: list = None
+        scale_ranges: list = None,
+        neighbor_cells: bool = True,
     ):
         super().__init__()
         self.focal_loss = FocalLoss(alpha=alpha, gamma=gamma)
         self.lambda_box = lambda_box
         self.lambda_cls = lambda_cls
         self.loss_type = loss_type.lower()
+        # When True, each GT is assigned to its centre cell plus the two cardinal
+        # neighbour cells it leans toward (YOLOv5-style), ~tripling the positive
+        # signal. The centre decode uses the (2*sigmoid - 0.5) form so a cell can
+        # place a box centre up to half a cell outside itself -- required for the
+        # neighbour cells to reach the target, and harmless for centre-only.
+        self.neighbor_cells = neighbor_cells
         self.scale_ranges = scale_ranges or [
             (0.0, 0.10),
             (0.08, 0.25),
@@ -275,14 +282,28 @@ class DetectionLoss(nn.Module):
                 if filtered_boxes.shape[0] == 0:
                     continue
 
-                gx = (filtered_boxes[:, 0] * W).long().clamp(0, W - 1)
-                gy = (filtered_boxes[:, 1] * H).long().clamp(0, H - 1)
+                cx = (filtered_boxes[:, 0] * W).clamp(0, W - 1e-4)
+                cy = (filtered_boxes[:, 1] * H).clamp(0, H - 1e-4)
+                gx = cx.long()
+                gy = cy.long()
 
                 for i in range(len(filtered_boxes)):
-                    x_c, y_c = gx[i], gy[i]
-                    target_obj[b, y_c, x_c] = 1.0
-                    target_boxes[b, y_c, x_c] = filtered_boxes[i]
-                    pos_mask[b, y_c, x_c] = True
+                    xi, yi = int(gx[i]), int(gy[i])
+                    cells = [(xi, yi)]
+                    if self.neighbor_cells:
+                        # fractional position inside the centre cell, in [0, 1)
+                        fx = float(cx[i] - xi)
+                        fy = float(cy[i] - yi)
+                        nx = xi + (-1 if fx < 0.5 else 1)
+                        ny = yi + (-1 if fy < 0.5 else 1)
+                        if 0 <= nx < W:
+                            cells.append((nx, yi))
+                        if 0 <= ny < H:
+                            cells.append((xi, ny))
+                    for xx, yy in cells:
+                        target_obj[b, yy, xx] = 1.0
+                        target_boxes[b, yy, xx] = filtered_boxes[i]
+                        pos_mask[b, yy, xx] = True
 
             total_cls_loss += self.focal_loss(preds[..., 4], target_obj, num_pos=total_pos_count)
 
@@ -291,10 +312,16 @@ class DetectionLoss(nn.Module):
                 pred_pos_raw = preds[pos_mask][..., :4]
                 target_pos = target_boxes[pos_mask]
 
-                px = (torch.sigmoid(pred_pos_raw[:, 0]) + x_idx.float()) / W
-                py = (torch.sigmoid(pred_pos_raw[:, 1]) + y_idx.float()) / H
-                pw = torch.exp(pred_pos_raw[:, 2]) / W
-                ph = torch.exp(pred_pos_raw[:, 3]) / H
+                # (2*sigmoid - 0.5): centre can land in [-0.5, 1.5) cells -> a
+                # neighbour cell can reach the true centre. Matches _decode_scale
+                # in src/core/postprocess.py.
+                px = (2.0 * torch.sigmoid(pred_pos_raw[:, 0]) - 0.5 + x_idx.float()) / W
+                py = (2.0 * torch.sigmoid(pred_pos_raw[:, 1]) - 0.5 + y_idx.float()) / H
+                # Clamp the exponent: under fp16 autocast exp(>11) overflows to inf,
+                # and inf/inf in the CIoU aspect term becomes NaN -> whole loss NaN.
+                # (Matches WH_EXP_CLAMP in src/core/postprocess.py.)
+                pw = torch.exp(pred_pos_raw[:, 2].clamp(max=8.0)) / W
+                ph = torch.exp(pred_pos_raw[:, 3].clamp(max=8.0)) / H
                 pred_boxes = torch.stack([px, py, pw, ph], dim=-1)
 
                 if self.loss_type == "eiou":
@@ -308,7 +335,9 @@ class DetectionLoss(nn.Module):
                 else:
                     iou_loss = 1.0 - bbox_iou(pred_boxes, target_pos)
 
-                total_box_loss += iou_loss.sum() / max(total_pos_count, 1)
+                # Mean over assigned cells (not GT count) so the box/cls balance
+                # is the same whether or not neighbour cells are assigned.
+                total_box_loss += iou_loss.mean()
 
         total_loss = (self.lambda_cls * (total_cls_loss / num_scales)) + (
             self.lambda_box * (total_box_loss / num_scales)
@@ -318,4 +347,141 @@ class DetectionLoss(nn.Module):
             "loss/total": total_loss.item(),
             "loss/cls": (total_cls_loss / num_scales).item(),
             "loss/box": (total_box_loss / num_scales).item(),
+        }
+
+
+# =============================================================================
+# V2 objective: Generalized Focal Loss (Li et al., NeurIPS 2020)
+#   QFL  — quality-focal objectness, soft target = IoU(pred, gt)
+#   DFL  — distribution focal loss on the 4 box-edge distributions
+#   CIoU — on the DFL-decoded box
+# For the DecoupledDFLHead in src/models/v2.py.
+# Head channel layout per cell: [obj(1), cls(C), box(4*(reg_max+1))].
+# =============================================================================
+from src.models.v2 import dfl_expectation  # noqa: E402
+
+
+def _xyxy_to_cxcywh(b: torch.Tensor) -> torch.Tensor:
+    return torch.stack(
+        [(b[:, 0] + b[:, 2]) / 2, (b[:, 1] + b[:, 3]) / 2, b[:, 2] - b[:, 0], b[:, 3] - b[:, 1]],
+        dim=-1,
+    )
+
+
+class DetectionLossV2(nn.Module):
+    def __init__(
+        self,
+        reg_max: int = 16,
+        scale_ranges: list = None,
+        neighbor_cells: bool = True,
+        lambda_qfl: float = 1.0,
+        lambda_cls: float = 0.5,
+        lambda_box: float = 2.0,
+        lambda_dfl: float = 0.5,
+        beta: float = 2.0,
+    ):
+        super().__init__()
+        self.reg_max = reg_max
+        self.neighbor_cells = neighbor_cells
+        self.scale_ranges = scale_ranges or [(0.0, 1.0)]
+        self.l_qfl, self.l_cls, self.l_box, self.l_dfl, self.beta = (
+            lambda_qfl, lambda_cls, lambda_box, lambda_dfl, beta,
+        )
+
+    def _dfl_loss(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # logits (N, 4, reg_max+1); target (N, 4) in [0, reg_max]
+        dl = target.floor().long().clamp(0, self.reg_max - 1)
+        dr = dl + 1
+        wl = dr.float() - target
+        wr = target - dl.float()
+        logits = logits.reshape(-1, self.reg_max + 1)
+        dl, dr, wl, wr = dl.reshape(-1), dr.reshape(-1), wl.reshape(-1), wr.reshape(-1)
+        loss = (F.cross_entropy(logits, dl, reduction="none") * wl
+                + F.cross_entropy(logits, dr, reduction="none") * wr)
+        return loss.mean()
+
+    def forward(self, pred_head_outputs: list, targets: list):
+        device = pred_head_outputs[0].device
+        n_gt = max(sum(t["boxes"].shape[0] for t in targets), 1)
+        num_scales = len(pred_head_outputs)
+        reg_ch = 4 * (self.reg_max + 1)
+
+        acc = {"qfl": torch.zeros((), device=device), "cls": torch.zeros((), device=device),
+               "box": torch.zeros((), device=device), "dfl": torch.zeros((), device=device)}
+
+        for si, p in enumerate(pred_head_outputs):
+            B, H, W, C = p.shape
+            n_classes = C - 1 - reg_ch
+            obj_logit = p[..., 0]
+            cls_logit = p[..., 1:1 + n_classes]
+            box_logit = p[..., 1 + n_classes:]
+            mn, mx = self.scale_ranges[si] if si < len(self.scale_ranges) else (0.0, 1.0)
+
+            obj_target = torch.zeros((B, H, W), device=device)
+            pos_mask = torch.zeros((B, H, W), dtype=torch.bool, device=device)
+            gt_cell = torch.zeros((B, H, W, 4), device=device)  # normalized xyxy
+
+            for b in range(B):
+                gt = targets[b]["boxes"].to(device)
+                if gt.numel() == 0:
+                    continue
+                max_edge = torch.max(gt[:, 2], gt[:, 3])
+                gt = gt[(max_edge >= mn) & (max_edge <= mx)]
+                if gt.numel() == 0:
+                    continue
+                cx = (gt[:, 0] * W).clamp(0, W - 1e-4)
+                cy = (gt[:, 1] * H).clamp(0, H - 1e-4)
+                gx, gy = cx.long(), cy.long()
+                gt_xyxy = torch.stack([gt[:, 0] - gt[:, 2] / 2, gt[:, 1] - gt[:, 3] / 2,
+                                       gt[:, 0] + gt[:, 2] / 2, gt[:, 1] + gt[:, 3] / 2], dim=-1)
+                for i in range(gt.shape[0]):
+                    xi, yi = int(gx[i]), int(gy[i])
+                    cells = [(xi, yi)]
+                    if self.neighbor_cells:
+                        fx, fy = float(cx[i] - xi), float(cy[i] - yi)
+                        nx = xi + (-1 if fx < 0.5 else 1)
+                        ny = yi + (-1 if fy < 0.5 else 1)
+                        if 0 <= nx < W:
+                            cells.append((nx, yi))
+                        if 0 <= ny < H:
+                            cells.append((xi, ny))
+                    for xx, yy in cells:
+                        obj_target[b, yy, xx] = 1.0
+                        pos_mask[b, yy, xx] = True
+                        gt_cell[b, yy, xx] = gt_xyxy[i]
+
+            if pos_mask.any():
+                b_i, y_i, x_i = torch.nonzero(pos_mask, as_tuple=True)
+                bl = box_logit[pos_mask]                             # (n_pos, 4*(rm+1))
+                ltrb = dfl_expectation(bl, self.reg_max)             # (n_pos, 4) cell units
+                cxg = x_i.float() + 0.5
+                cyg = y_i.float() + 0.5
+                pred_xyxy = torch.stack([(cxg - ltrb[:, 0]) / W, (cyg - ltrb[:, 1]) / H,
+                                         (cxg + ltrb[:, 2]) / W, (cyg + ltrb[:, 3]) / H], dim=-1)
+                tgt_xyxy = gt_cell[pos_mask]
+                iou = bbox_ciou(_xyxy_to_cxcywh(pred_xyxy), _xyxy_to_cxcywh(tgt_xyxy)).clamp(-1, 1)
+                acc["box"] = acc["box"] + (1.0 - iou).mean()
+
+                tgt_ltrb = torch.stack([cxg - tgt_xyxy[:, 0] * W, cyg - tgt_xyxy[:, 1] * H,
+                                        tgt_xyxy[:, 2] * W - cxg, tgt_xyxy[:, 3] * H - cyg], dim=-1)
+                tgt_ltrb = tgt_ltrb.clamp(0, self.reg_max - 0.01)
+                acc["dfl"] = acc["dfl"] + self._dfl_loss(
+                    bl.reshape(-1, 4, self.reg_max + 1), tgt_ltrb)
+
+                # soft objectness target = localisation quality
+                obj_target[b_i, y_i, x_i] = iou.detach().clamp(0, 1)
+                acc["cls"] = acc["cls"] + F.binary_cross_entropy_with_logits(
+                    cls_logit[pos_mask], torch.ones_like(cls_logit[pos_mask]), reduction="mean")
+
+            p_obj = torch.sigmoid(obj_logit)
+            qfl = ((obj_target - p_obj).abs().pow(self.beta)
+                   * F.binary_cross_entropy_with_logits(obj_logit, obj_target, reduction="none"))
+            acc["qfl"] = acc["qfl"] + qfl.sum() / n_gt
+
+        total = (self.l_qfl * acc["qfl"] + self.l_cls * acc["cls"]
+                 + self.l_box * acc["box"] + self.l_dfl * acc["dfl"]) / num_scales
+        return total, {
+            "loss/total": total.item(),
+            "loss/cls": ((self.l_qfl * acc["qfl"] + self.l_cls * acc["cls"]) / num_scales).item(),
+            "loss/box": ((self.l_box * acc["box"] + self.l_dfl * acc["dfl"]) / num_scales).item(),
         }

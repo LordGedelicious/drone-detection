@@ -92,26 +92,27 @@ class P2GranularDetector(BaseDetector):
                 Tensor(B, H/32, W/32, 5 + num_classes)   # P5 Head (Coarse)
             ]
         """
-        # 1. Bottom-up Backbone
-        x = self.stem(x)
-        c2 = self.stage2(x)  # (B, 64, 160, 160)
-        c3 = self.stage3(c2) # (B, 128, 80, 80)
-        c4 = self.stage4(c3) # (B, 256, 40, 40)
-        c5 = self.stage5(c4) # (B, 512, 20, 20)
-
-        # 2. Top-down Pathway with P2 Addition
-        p5 = self.lateral_c5(c5)                                # (B, 128, 20, 20)
-        p4 = self.smooth_p4(self.lateral_c4(c4) + self.upsample(p5))  # (B, 128, 40, 40)
-        p3 = self.smooth_p3(self.lateral_c3(c3) + self.upsample(p4))  # (B, 128, 80, 80)
-        p2 = self.smooth_p2(self.lateral_c2(c2) + self.upsample(p3))  # (B, 128, 160, 160)
-
-        # 3. Compute 4-Scale Predictions
+        p2, p3, p4, p5 = self.neck_forward(x)
         out_p2 = self.head_p2(p2).permute(0, 2, 3, 1).contiguous()
         out_p3 = self.head_p3(p3).permute(0, 2, 3, 1).contiguous()
         out_p4 = self.head_p4(p4).permute(0, 2, 3, 1).contiguous()
         out_p5 = self.head_p5(p5).permute(0, 2, 3, 1).contiguous()
-
         return [out_p2, out_p3, out_p4, out_p5]
+
+    neck_channels = [128, 128, 128, 128]  # fpn_out_channels, x4
+
+    def neck_forward(self, x: torch.Tensor) -> list:
+        """Backbone + top-down FPN with the extra P2 level -> [P2, P3, P4, P5]."""
+        x = self.stem(x)
+        c2 = self.stage2(x)
+        c3 = self.stage3(c2)
+        c4 = self.stage4(c3)
+        c5 = self.stage5(c4)
+        p5 = self.lateral_c5(c5)
+        p4 = self.smooth_p4(self.lateral_c4(c4) + self.upsample(p5))
+        p3 = self.smooth_p3(self.lateral_c3(c3) + self.upsample(p4))
+        p2 = self.smooth_p2(self.lateral_c2(c2) + self.upsample(p3))
+        return [p2, p3, p4, p5]
 
 
 # --- Quick Unit Test & Shape Verification ---

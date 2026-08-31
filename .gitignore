@@ -1,25 +1,28 @@
-cat << 'EOF' > .gitignore
-# Python cache
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
 .venv/
 env/
+.ipynb_checkpoints/
 
-# Datasets and large media
+# Datasets and large media (fetched separately, see README)
 data/
 *.zip
-*.tar.gz
 *.tar
+*.tar.gz
+# frozen train/val/test manifests live in splits/ and ARE tracked
 
-# Model checkpoints & weights
+# Model checkpoints & weights (ship via Git LFS or an external URL)
 checkpoints/
 *.pt
 *.pth
 *.onnx
 
-# Tracking and IDE
+# Experiment tracking / outputs
 wandb/
+runs/
+
+# IDE
 .vscode/
-.ipynb_checkpoints/
-EOF
+.idea/

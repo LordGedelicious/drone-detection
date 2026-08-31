@@ -52,26 +52,21 @@ class SingleScaleDetector(BaseDetector):
         self._init_weights()
         self._init_detection_head_prior(self.head_conv[-1])
 
-    def forward(self, x: torch.Tensor) -> list:
-        """
-        Forward pass.
-        Returns:
-            List containing one tensor of shape (B, H_p5, W_p5, 5 + num_classes)
-            ready for DetectionLoss and MetricEvaluator consumption.
-        """
+    # Channels of the feature map(s) fed to the detection head(s) — used by the
+    # V2 refinement (src/models/v2.py) to attach replacement heads.
+    neck_channels = [512]  # base_channels * 16
+
+    def neck_forward(self, x: torch.Tensor) -> list:
+        """Backbone -> the single P5 feature map the head consumes."""
         x = self.stem(x)
         x = self.stage2(x)
         x = self.stage3(x)
         x = self.stage4(x)
-        p5 = self.stage5(x)
+        return [self.stage5(x)]
 
-        # Output raw logits: (B, 5 + num_classes, H/32, W/32)
-        out = self.head_conv(p5)
-
-        # Permute to channels-last layout: (B, H/32, W/32, 5 + num_classes)
-        out = out.permute(0, 2, 3, 1).contiguous()
-
-        return [out]
+    def forward(self, x: torch.Tensor) -> list:
+        (p5,) = self.neck_forward(x)
+        return [self.head_conv(p5).permute(0, 2, 3, 1).contiguous()]
 
 
 # --- Quick Unit Test & Shape Verification ---
