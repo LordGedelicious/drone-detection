@@ -1,117 +1,94 @@
+"""Train one from-scratch detector (baseline / fpn / p2) on the drone dataset.
+
+Example:
+    python train.py --model fpn --epochs 50 --loss-type iciou
+
+The pretrained/library reference models (YOLOv26, AB2D-YOLO) are deliberately
+not reachable from here -- see src/models/reference/.
+"""
+
 import argparse
 import torch
 import torch.optim as optim
-from torch.utils.data import DataLoader, Subset, random_split
 
-from src.core.dataset import DroneDataset, get_train_transforms, get_val_transforms, collate_fn
-from src.core.loss import DetectionLoss
-from src.models.single_scale import SingleScaleDetector
-from src.models.multi_scale_fpn import MultiScaleFPNDetector
-from src.models.p2_granular import P2GranularDetector
-from src.models.ab2d_yolo import AB2DYOLO
-from src.models.yolov26 import YOLOv26Benchmark
+from src.core.runtime import configure
+from src.core import complexity
+from src.engine.factory import build_model, build_criterion, build_dataloaders, build_scheduler, MODEL_NAMES
 from src.engine.singlegpu_trainer import SingleGPUTrainer
 from src.engine.wnb_tracker import WandbTracker
 
+
 def parse_args():
-    parser = argparse.ArgumentParser()
-    # Default set to the Single-Scale Baseline; yolo26 added to choices
-    parser.add_argument("--model", type=str, default="baseline", choices=["baseline", "fpn", "p2", "ab2d", "yolo26"], help="Select model architecture.")
-    
-    # Removed leading slashes so paths resolve relative to your repository root
-    parser.add_argument("--img-dir", type=str, default="data/images", help="Path to images directory.")
-    parser.add_argument("--lbl-dir", type=str, default="data/labels", help="Path to labels directory.")
-    parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs.")
-    parser.add_argument("--batch-size", type=int, default=16, help="Batch size per GPU.")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Initial learning rate.")
-    parser.add_argument("--loss-type", type=str, default="iciou", choices=["iou", "ciou", "eiou", "siou", "iciou"], help="Bounding box regression loss type.")
-    
-    # YOLOv26 specific argument
-    parser.add_argument("--yolo-data", type=str, default="drone_data.yaml", help="Path to yaml config for YOLOv26 benchmark.")
-    return parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--model", type=str, default="baseline", choices=MODEL_NAMES)
+    p.add_argument("--img-dir", type=str, default="data/images")
+    p.add_argument("--lbl-dir", type=str, default="data/labels")
+    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument("--batch-size", type=int, default=16)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--warmup-epochs", type=int, default=3)
+    p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--img-size", type=int, default=640)
+    p.add_argument("--loss-type", type=str, default="iciou",
+                   choices=["iou", "ciou", "eiou", "siou", "iciou"])
+    p.add_argument("--neighbor-cells", action=argparse.BooleanOptionalAction, default=True,
+                   help="assign each GT to its centre cell + 2 nearest neighbours")
+    p.add_argument("--scene-counts", type=int, nargs=3, default=(48, 6, 6),
+                   metavar=("TRAIN", "VAL", "TEST"), help="scene counts per split")
+    p.add_argument("--split-seed", type=int, default=42)
+    p.add_argument("--split-manifest", type=str, default=None,
+                   help="freeze/reuse the split via a JSON manifest")
+    p.add_argument("--workers", type=int, default=8)
+    p.add_argument("--ckpt-dir", type=str, default="checkpoints")
+    p.add_argument("--run-name", type=str, default=None)
+    p.add_argument("--no-wandb", action="store_true")
+    p.add_argument("--seed", type=int, default=42)
+    return p.parse_args()
+
 
 def main():
     args = parse_args()
+    configure(cpu_threads=args.workers, seed=args.seed)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # 1. Routing for Ultralytics YOLOv26 Benchmark (Bypasses custom trainer)
-    if args.model == "yolo26":
-        print(f"Launching YOLOv26 Benchmark Training for {args.epochs} epochs...")
-        model = YOLOv26Benchmark(model_weight="yolov8n.pt", num_classes=1)
-        model.train_benchmark(
-            data_yaml=args.yolo_data,
-            epochs=args.epochs,
-            imgsz=640,
-            batch=args.batch_size,
-            project="drone-detection",
-            name="yolov26_benchmark"
-        )
-        return
+    loaders = build_dataloaders(
+        args.img_dir, args.lbl_dir, img_size=args.img_size, batch_size=args.batch_size,
+        which=("train", "val"), scene_counts=tuple(args.scene_counts), seed=args.split_seed,
+        manifest_path=args.split_manifest, train_workers=args.workers,
+    )
+    print(f"train batches: {len(loaders['train'])} | val batches: {len(loaders['val'])}")
 
-    # 2. Dynamic Dataset Splitting (80/20) for Custom Models
-    base_dataset = DroneDataset(args.img_dir, args.lbl_dir, transforms=None)
-    train_size = int(0.8 * len(base_dataset))
-    val_size = len(base_dataset) - train_size
-    train_idx, val_idx = random_split(range(len(base_dataset)), [train_size, val_size], generator=torch.Generator().manual_seed(42))
+    model = build_model(args.model)
+    criterion = build_criterion(args.model, args.loss_type, neighbor_cells=args.neighbor_cells)
 
-    train_dataset = Subset(DroneDataset(args.img_dir, args.lbl_dir, transforms=get_train_transforms(640)), train_idx)
-    val_dataset = Subset(DroneDataset(args.img_dir, args.lbl_dir, transforms=get_val_transforms(640)), val_idx)
+    prof = complexity.parameter_count(model)
+    print(f"model '{args.model}': {prof['params_millions']:.2f}M params")
 
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=args.batch_size, 
-        shuffle=True, 
-        collate_fn=collate_fn, 
-        num_workers=12,
-        persistent_workers=True,
-        prefetch_factor=2,
-        pin_memory=True
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = build_scheduler(optimizer, args.epochs, warmup_epochs=args.warmup_epochs)
+
+    tracker = WandbTracker(
+        project_name="drone-detection",
+        run_name=args.run_name or f"{args.model}_{args.loss_type}",
+        config={**vars(args), **prof},
+        enabled=not args.no_wandb,
     )
 
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=args.batch_size, 
-        shuffle=False, 
-        collate_fn=collate_fn, 
-        num_workers=4,
-        persistent_workers=True,
-        prefetch_factor=2,
-        pin_memory=True
-    )
-
-    # 3. Dynamic Model & Loss Configuration
-    if args.model == "baseline":
-        model = SingleScaleDetector(num_classes=1)
-        scale_ranges = [(0.0, 1.0)]  # 1 Scale
-    elif args.model == "fpn":
-        model = MultiScaleFPNDetector(num_classes=1)
-        scale_ranges = [(0.0, 0.10), (0.08, 0.25), (0.20, 1.00)]  # 3 Scales (P3, P4, P5)
-    elif args.model == "p2":
-        model = P2GranularDetector(num_classes=1)
-        scale_ranges = [(0.0, 0.05), (0.04, 0.12), (0.10, 0.28), (0.25, 1.00)]  # 4 Scales (P2, P3, P4, P5)
-    elif args.model == "ab2d":
-        model = AB2DYOLO(num_classes=1)
-        scale_ranges = [(0.0, 0.05), (0.04, 0.12), (0.10, 0.28), (0.25, 1.00)]  # 4 Scales
-
-    criterion = DetectionLoss(loss_type=args.loss_type, scale_ranges=scale_ranges)
-
-    # 4. Optimizer & Tracking
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    tracker = WandbTracker(project_name="drone-detection", run_name=f"{args.model}_run", config=vars(args))
-
-    # 5. Launch Custom Training
     trainer = SingleGPUTrainer(
         model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
+        train_loader=loaders["train"],
+        val_loader=loaders["val"],
         criterion=criterion,
         optimizer=optimizer,
-        lr_scheduler=torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs),
+        lr_scheduler=scheduler,
         tracker=tracker,
+        device=device,
         model_name=args.model,
-        device="cuda"  # Add this line to force GPU usage
+        img_size=args.img_size,
+        checkpoint_dir=args.ckpt_dir,
     )
-    
     trainer.fit(epochs=args.epochs)
+
 
 if __name__ == "__main__":
     main()

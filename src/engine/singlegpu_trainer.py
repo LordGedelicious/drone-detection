@@ -1,17 +1,18 @@
 import os
+import time
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+
 from src.core.metrics import MetricEvaluator
+from src.engine.evaluation import run_evaluation
 from src.engine.wnb_tracker import WandbTracker
-import torchvision
 
 
 class SingleGPUTrainer:
-    """
-    Trainer orchestrator for single-GPU training and validation.
-    """
+    """Trainer orchestrator for single-GPU training and validation."""
+
     def __init__(
         self,
         model: nn.Module,
@@ -23,7 +24,12 @@ class SingleGPUTrainer:
         tracker: WandbTracker,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         checkpoint_dir: str = "checkpoints",
-        model_name: str = "model"
+        model_name: str = "model",
+        img_size: int = 640,
+        grad_clip: float = 10.0,
+        eval_conf: float = 0.01,
+        eval_iou: float = 0.5,
+        max_det: int = 300,
     ):
         self.device = torch.device(device)
         self.model = model.to(self.device)
@@ -35,118 +41,90 @@ class SingleGPUTrainer:
         self.tracker = tracker
         self.checkpoint_dir = checkpoint_dir
         self.model_name = model_name
+        self.grad_clip = grad_clip
+        self.eval_conf = eval_conf
+        self.eval_iou = eval_iou
+        self.max_det = max_det
 
         self.scaler = torch.amp.GradScaler("cuda", enabled=(self.device.type == "cuda"))
-        self.evaluator = MetricEvaluator(conf_threshold=0.001)
+        self.evaluator = MetricEvaluator(img_size=img_size)
         self.best_mAP = 0.0
+        self._backed_up = set()  # filenames whose pre-existing copy we already moved aside
 
     def train_epoch(self, epoch: int) -> dict:
         self.model.train()
-        running_loss = 0.0
-        running_cls = 0.0
-        running_box = 0.0
+        running_loss = running_cls = running_box = 0.0
+        n_ok = 0
+        skipped = 0
 
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1} [Train]", leave=False)
         for images, targets in pbar:
             images = images.to(self.device, non_blocking=True)
-
             self.optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast("cuda", enabled=(self.device.type == "cuda")):
                 preds = self.model(images)
                 loss, loss_dict = self.criterion(preds, targets)
 
+            # A non-finite loss (should not happen now that the box exp() is
+            # clamped, but keep the guard) would poison every weight via backward.
+            if not torch.isfinite(loss):
+                skipped += 1
+                continue
+
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip)
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
             running_loss += loss_dict["loss/total"]
             running_cls += loss_dict["loss/cls"]
             running_box += loss_dict["loss/box"]
+            n_ok += 1
             pbar.set_postfix({"loss": f"{loss_dict['loss/total']:.4f}"})
 
-        num_batches = len(self.train_loader)
+        if skipped:
+            print(f"[trainer] epoch {epoch+1}: skipped {skipped} non-finite batch(es)")
+        n_ok = max(n_ok, 1)
         return {
-            "train/total_loss": running_loss / num_batches,
-            "train/cls_loss": running_cls / num_batches,
-            "train/box_loss": running_box / num_batches,
-            "train/lr": self.optimizer.param_groups[0]["lr"]
+            "train/total_loss": running_loss / n_ok,
+            "train/cls_loss": running_cls / n_ok,
+            "train/box_loss": running_box / n_ok,
+            "train/lr": self.optimizer.param_groups[0]["lr"],
+            "train/skipped_batches": skipped,
         }
 
-    @torch.no_grad()
     def evaluate(self, epoch: int) -> dict:
-        self.model.eval()
-        self.evaluator.reset()
-        val_loss = 0.0
+        return run_evaluation(
+            self.model, self.val_loader, self.evaluator, self.device,
+            criterion=self.criterion, conf_thresh=self.eval_conf,
+            iou_thresh=self.eval_iou, max_det=self.max_det,
+            desc=f"Epoch {epoch+1} [Val]",
+        )
 
-        pbar = tqdm(self.val_loader, desc=f"Epoch {epoch+1} [Val]", leave=False)
-        for images, targets in pbar:
-            images = images.to(self.device, non_blocking=True)
+    def _save(self, epoch: int, filename: str):
+        # Never silently clobber a checkpoint from a previous run: the first time
+        # this run writes a given filename, move any existing file aside.
+        path = os.path.join(self.checkpoint_dir, filename)
+        if filename not in self._backed_up:
+            self._backed_up.add(filename)
+            if os.path.exists(path):
+                bak = f"{path}.prev-{time.strftime('%Y%m%d-%H%M%S')}"
+                os.rename(path, bak)
+                print(f"[trainer] existing {filename} preserved as {os.path.basename(bak)}")
 
-            with torch.amp.autocast("cuda", enabled=(self.device.type == "cuda")):
-                preds = self.model(images)
-                loss, loss_dict = self.criterion(preds, targets)
-
-            val_loss += loss_dict["loss/total"]
-
-            # Evaluate each sample in batch
-            batch_size = images.shape[0]
-            for b in range(batch_size):
-                tgt_boxes = targets[b]["boxes"].to(self.device)
-                
-                # Flatten multi-scale predictions for decoding
-                all_boxes = []
-                all_confs = []
-                for scale_preds in preds:
-                    H, W = scale_preds.shape[1], scale_preds.shape[2]
-                    grid_y, grid_x = torch.meshgrid(
-                        torch.arange(H, device=self.device),
-                        torch.arange(W, device=self.device),
-                        indexing="ij"
-                    )
-                    pred_b = scale_preds[b]  # (H, W, 5 + C)
-                    px = (torch.sigmoid(pred_b[..., 0]) + grid_x) / W
-                    py = (torch.sigmoid(pred_b[..., 1]) + grid_y) / H
-                    pw = torch.exp(pred_b[..., 2]) / W
-                    ph = torch.exp(pred_b[..., 3]) / H
-                    conf = torch.sigmoid(pred_b[..., 4])
-
-                    boxes = torch.stack([px, py, pw, ph], dim=-1).view(-1, 4)
-                    confs = conf.view(-1)
-                    all_boxes.append(boxes)
-                    all_confs.append(confs)
-
-                comb_boxes = torch.cat(all_boxes, dim=0)
-                comb_confs = torch.cat(all_confs, dim=0)
-
-                # 1. Pre-filter ultra-low confidences to speed up NMS computation
-                valid_mask = comb_confs > 0.001
-                comb_boxes = comb_boxes[valid_mask]
-                comb_confs = comb_confs[valid_mask]
-
-                # 2. Apply Non-Maximum Suppression (NMS)
-                if comb_boxes.shape[0] > 0:
-                    # NMS requires boxes in (x1, y1, x2, y2) format
-                    xyxy_boxes = torch.zeros_like(comb_boxes)
-                    xyxy_boxes[:, 0] = comb_boxes[:, 0] - comb_boxes[:, 2] / 2
-                    xyxy_boxes[:, 1] = comb_boxes[:, 1] - comb_boxes[:, 3] / 2
-                    xyxy_boxes[:, 2] = comb_boxes[:, 0] + comb_boxes[:, 2] / 2
-                    xyxy_boxes[:, 3] = comb_boxes[:, 1] + comb_boxes[:, 3] / 2
-                    
-                    # Suppress overlapping boxes with IoU > 0.45
-                    keep_idx = torchvision.ops.nms(xyxy_boxes, comb_confs, iou_threshold=0.45)
-                    
-                    comb_boxes = comb_boxes[keep_idx]
-                    comb_confs = comb_confs[keep_idx]
-
-                # Reduce probability of GPU OOM issues
-                self.evaluator.update(comb_boxes.detach().cpu(), comb_confs.detach().cpu(), tgt_boxes.detach().cpu())
-        
-        metrics = self.evaluator.compute_metrics()
-        metrics["val/total_loss"] = val_loss / len(self.val_loader)
-        return metrics
+        self.tracker.save_checkpoint(
+            {
+                "epoch": epoch + 1,
+                "model_name": self.model_name,
+                "model_state_dict": self.model.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "best_mAP": self.best_mAP,
+            },
+            checkpoint_dir=self.checkpoint_dir,
+            filename=filename,
+        )
 
     def fit(self, epochs: int):
         for epoch in range(epochs):
@@ -156,29 +134,19 @@ class SingleGPUTrainer:
             if self.lr_scheduler is not None:
                 self.lr_scheduler.step()
 
-            log_payload = {**train_metrics, **val_metrics, "epoch": epoch + 1}
-            self.tracker.log(log_payload, step=epoch + 1)
-
+            self.tracker.log({**train_metrics, **val_metrics, "epoch": epoch + 1}, step=epoch + 1)
             print(
                 f"Epoch [{epoch+1}/{epochs}] | "
-                f"Train Loss: {train_metrics['train/total_loss']:.4f} | "
-                f"Val Loss: {val_metrics['val/total_loss']:.4f} | "
-                f"mAP@0.5: {val_metrics['mAP_50']:.4f} | "
-                f"mAP@0.5:0.95: {val_metrics['mAP_50_95']:.4f}"
+                f"Train {train_metrics['train/total_loss']:.4f} | "
+                f"Val {val_metrics.get('val/total_loss', float('nan')):.4f} | "
+                f"mAP@0.5 {val_metrics['mAP_50']:.4f} | "
+                f"mAP@0.5:0.95 {val_metrics['mAP_50_95']:.4f} | "
+                f"F1 {val_metrics['f1_score']:.4f}"
             )
 
-            # Checkpoint best model
+            self._save(epoch, f"{self.model_name}_last.pth")
             if val_metrics["mAP_50"] > self.best_mAP:
                 self.best_mAP = val_metrics["mAP_50"]
-                self.tracker.save_checkpoint(
-                    {
-                        "epoch": epoch + 1,
-                        "model_state_dict": self.model.state_dict(),
-                        "optimizer_state_dict": self.optimizer.state_dict(),
-                        "best_mAP": self.best_mAP
-                    },
-                    checkpoint_dir=self.checkpoint_dir,
-                    filename=f"{self.model_name}_best.pth"
-                )
+                self._save(epoch, f"{self.model_name}_best.pth")
 
         self.tracker.finish()
