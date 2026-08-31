@@ -28,8 +28,8 @@ for line in "${TOP[@]}"; do
     read -r lr gamma <<< "$cfg"
     j="$RES/search/${model}_lr${lr}_g${gamma}.json"
     [ -f "$j" ] && continue
-    python refine.py --model "$model" --base-weights "$ckpt" --epochs "$SEARCH_EPOCHS" \
-        --peak-lr "$lr" --llrd "$gamma" --split val --no-wandb \
+    python train.py --mode refine --model "$model" --base-weights "$ckpt" --epochs "$SEARCH_EPOCHS" \
+        --peak-lr "$lr" --llrd "$gamma" --eval-split val --no-wandb \
         --split-manifest "$MANIFEST" --ckpt-dir "checkpoints/v2/search_${model}" \
         --json "$j" --run-name "${model}_v2_search_lr${lr}_g${gamma}" \
         > "$RES/search/${model}_lr${lr}_g${gamma}.log" 2>&1
@@ -53,8 +53,8 @@ for line in "${TOP[@]}"; do
   read -r model ckpt score run <<< "$line"
   read -r lr gamma sc <<< "${BEST_CFG[$model]}"
   echo "[$(date +%H:%M)] === Stage 2 final: ${model}_v2  (lr=$lr gamma=$gamma, search mAP50-95 $sc) ==="
-  python refine.py --model "$model" --base-weights "$ckpt" --epochs "$FINAL_EPOCHS" \
-      --peak-lr "$lr" --llrd "$gamma" --split test --profile \
+  python train.py --mode refine --model "$model" --base-weights "$ckpt" --epochs "$FINAL_EPOCHS" \
+      --peak-lr "$lr" --llrd "$gamma" --eval-split test --profile \
       --split-manifest "$MANIFEST" --ckpt-dir "checkpoints/v2/${model}_v2" \
       --final-dir models_final --json "$RES/final/${model}_v2_test.json" \
       --run-name "${model}_v2" > "$RES/final/${model}_v2.log" 2>&1

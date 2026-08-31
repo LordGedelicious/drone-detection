@@ -6,6 +6,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.core.metrics import MetricEvaluator
+from src.core.ema import ModelEMA
 from src.engine.evaluation import run_evaluation
 from src.engine.wnb_tracker import WandbTracker
 
@@ -30,6 +31,9 @@ class SingleGPUTrainer:
         eval_conf: float = 0.01,
         eval_iou: float = 0.5,
         max_det: int = 300,
+        ema_decay: float = None,
+        decode=None,
+        select_metric: str = "mAP_50",
     ):
         self.device = torch.device(device)
         self.model = model.to(self.device)
@@ -48,6 +52,9 @@ class SingleGPUTrainer:
 
         self.scaler = torch.amp.GradScaler("cuda", enabled=(self.device.type == "cuda"))
         self.evaluator = MetricEvaluator(img_size=img_size)
+        self.decode = decode
+        self.select_metric = select_metric
+        self.ema = ModelEMA(self.model, decay=ema_decay) if ema_decay else None
         self.best_mAP = 0.0
         self._backed_up = set()  # filenames whose pre-existing copy we already moved aside
 
@@ -77,6 +84,8 @@ class SingleGPUTrainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip)
             self.scaler.step(self.optimizer)
             self.scaler.update()
+            if self.ema:
+                self.ema.update(self.model)
 
             running_loss += loss_dict["loss/total"]
             running_cls += loss_dict["loss/cls"]
@@ -95,11 +104,15 @@ class SingleGPUTrainer:
             "train/skipped_batches": skipped,
         }
 
+    @property
+    def eval_model(self):
+        return self.ema.ema if self.ema else self.model
+
     def evaluate(self, epoch: int) -> dict:
         return run_evaluation(
-            self.model, self.val_loader, self.evaluator, self.device,
+            self.eval_model, self.val_loader, self.evaluator, self.device,
             criterion=self.criterion, conf_thresh=self.eval_conf,
-            iou_thresh=self.eval_iou, max_det=self.max_det,
+            iou_thresh=self.eval_iou, max_det=self.max_det, decode=self.decode,
             desc=f"Epoch {epoch+1} [Val]",
         )
 
@@ -118,7 +131,7 @@ class SingleGPUTrainer:
             {
                 "epoch": epoch + 1,
                 "model_name": self.model_name,
-                "model_state_dict": self.model.state_dict(),
+                "model_state_dict": self.eval_model.state_dict(),
                 "optimizer_state_dict": self.optimizer.state_dict(),
                 "best_mAP": self.best_mAP,
             },
@@ -145,8 +158,8 @@ class SingleGPUTrainer:
             )
 
             self._save(epoch, f"{self.model_name}_last.pth")
-            if val_metrics["mAP_50"] > self.best_mAP:
-                self.best_mAP = val_metrics["mAP_50"]
+            if val_metrics[self.select_metric] > self.best_mAP:
+                self.best_mAP = val_metrics[self.select_metric]
                 self._save(epoch, f"{self.model_name}_best.pth")
 
         self.tracker.finish()

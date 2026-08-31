@@ -485,3 +485,179 @@ class DetectionLossV2(nn.Module):
             "loss/cls": ((self.l_qfl * acc["qfl"] + self.l_cls * acc["cls"]) / num_scales).item(),
             "loss/box": ((self.l_box * acc["box"] + self.l_dfl * acc["dfl"]) / num_scales).item(),
         }
+
+
+# =============================================================================
+# V3 objective: Task-Aligned Loss for FinalDetector.
+#   dynamic task-aligned assignment (TOOD / YOLOv8) + Varifocal objectness
+#   (VarifocalNet) + alignment-weighted DFL + MPDIoU (or CIoU) box term.
+# Head channel layout per cell: [obj(1), cls(C), box(4*(reg_max+1))].
+# =============================================================================
+def _pairwise_iou_xyxy(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    """(n,4),(m,4) xyxy -> (n,m) IoU."""
+    area_a = (a[:, 2] - a[:, 0]).clamp(0) * (a[:, 3] - a[:, 1]).clamp(0)
+    area_b = (b[:, 2] - b[:, 0]).clamp(0) * (b[:, 3] - b[:, 1]).clamp(0)
+    lt = torch.max(a[:, None, :2], b[None, :, :2])
+    rb = torch.min(a[:, None, 2:], b[None, :, 2:])
+    wh = (rb - lt).clamp(0)
+    inter = wh[..., 0] * wh[..., 1]
+    return inter / (area_a[:, None] + area_b[None, :] - inter + eps)
+
+
+def bbox_mpdiou(p: torch.Tensor, t: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    """Elementwise MPDIoU for matched (n,4) xyxy pairs, normalised coords
+    (image diagonal squared = 1^2 + 1^2 = 2)."""
+    x1 = torch.max(p[:, 0], t[:, 0]); y1 = torch.max(p[:, 1], t[:, 1])
+    x2 = torch.min(p[:, 2], t[:, 2]); y2 = torch.min(p[:, 3], t[:, 3])
+    inter = (x2 - x1).clamp(0) * (y2 - y1).clamp(0)
+    ap = (p[:, 2] - p[:, 0]).clamp(0) * (p[:, 3] - p[:, 1]).clamp(0)
+    at = (t[:, 2] - t[:, 0]).clamp(0) * (t[:, 3] - t[:, 1]).clamp(0)
+    iou = inter / (ap + at - inter + eps)
+    d1 = (p[:, 0] - t[:, 0]) ** 2 + (p[:, 1] - t[:, 1]) ** 2
+    d2 = (p[:, 2] - t[:, 2]) ** 2 + (p[:, 3] - t[:, 3]) ** 2
+    return iou - (d1 + d2) / 2.0
+
+
+class TaskAlignedLoss(nn.Module):
+    def __init__(self, reg_max: int = 16, num_classes: int = 1,
+                 topk: int = 10, alpha: float = 0.5, beta: float = 6.0,
+                 iou_type: str = "ciou",
+                 w_obj: float = 1.0, w_cls: float = 0.5, w_box: float = 2.5, w_dfl: float = 0.5,
+                 vfl_alpha: float = 0.75, vfl_gamma: float = 2.0):
+        super().__init__()
+        self.reg_max = reg_max
+        self.nc = num_classes
+        self.topk, self.alpha, self.beta = topk, alpha, beta
+        self.iou_type = iou_type
+        self.w_obj, self.w_cls, self.w_box, self.w_dfl = w_obj, w_cls, w_box, w_dfl
+        self.vfl_alpha, self.vfl_gamma = vfl_alpha, vfl_gamma
+
+    # ---- flatten heads into one cell list, with per-cell grid geometry ----
+    def _flatten(self, preds):
+        obj, cls, box, cxy, gw = [], [], [], [], []
+        for p in preds:
+            B, H, W, C = p.shape
+            dev = p.device
+            gy, gx = torch.meshgrid(torch.arange(H, device=dev), torch.arange(W, device=dev), indexing="ij")
+            cx = ((gx + 0.5) / W).reshape(-1)
+            cy = ((gy + 0.5) / H).reshape(-1)
+            obj.append(p[..., 0].reshape(B, -1))
+            cls.append(p[..., 1:1 + self.nc].reshape(B, -1, self.nc))
+            box.append(p[..., 1 + self.nc:].reshape(B, -1, 4 * (self.reg_max + 1)))
+            cxy.append(torch.stack([cx, cy], -1))                 # (HW, 2)
+            gw.append(torch.full((H * W,), float(W), device=dev)) # grid width per cell
+        return (torch.cat(obj, 1), torch.cat(cls, 1), torch.cat(box, 1),
+                torch.cat(cxy, 0), torch.cat(gw, 0))
+
+    def _decode_xyxy(self, box_logits, cxy, gw):
+        """box_logits (N, 4*(rm+1)); returns (N,4) xyxy normalised."""
+        ltrb = dfl_expectation(box_logits, self.reg_max) / gw[:, None]   # cell units -> normalised
+        x1 = cxy[:, 0] - ltrb[:, 0]; y1 = cxy[:, 1] - ltrb[:, 1]
+        x2 = cxy[:, 0] + ltrb[:, 2]; y2 = cxy[:, 1] + ltrb[:, 3]
+        return torch.stack([x1, y1, x2, y2], -1)
+
+    @torch.no_grad()
+    def _assign(self, pred_xyxy, scores, gt_xyxy, cxy):
+        N, M = pred_xyxy.shape[0], gt_xyxy.shape[0]
+        dev = pred_xyxy.device
+        # cell centre inside GT box
+        lt = cxy[:, None, :] - gt_xyxy[None, :, :2]
+        rb = gt_xyxy[None, :, 2:] - cxy[:, None, :]
+        in_gt = torch.cat([lt, rb], -1).amin(-1) > 1e-6              # (N, M)
+        iou = _pairwise_iou_xyxy(pred_xyxy, gt_xyxy)                 # (N, M)
+        align = scores[:, None].clamp(min=1e-6) ** self.alpha * iou.clamp(min=0) ** self.beta
+        align = align * in_gt
+        is_pos = torch.zeros(N, M, dtype=torch.bool, device=dev)
+        k = min(self.topk, N)
+        topv, topi = align.topk(k, dim=0)                           # (k, M)
+        for j in range(M):
+            sel = topi[topv[:, j] > 0, j]
+            is_pos[sel, j] = True
+        is_pos &= in_gt
+        # resolve multi-assignment by max IoU
+        multi = is_pos.sum(1) > 1
+        if multi.any():
+            best = iou.argmax(1)
+            is_pos[multi] = False
+            is_pos[multi, best[multi]] = True
+        fg = is_pos.any(1)
+        if not fg.any():
+            return fg, torch.zeros(N, dtype=torch.long, device=dev), torch.zeros(N, device=dev)
+        gt_idx = is_pos.float().argmax(1)
+        # per-GT normalised alignment target (YOLOv8): align / align_max * iou_max
+        align_pos = align * is_pos
+        norm = align_pos / (align_pos.amax(0, keepdim=True) + 1e-9) * (iou * is_pos).amax(0, keepdim=True)
+        t_norm = norm.amax(1)
+        return fg, gt_idx, t_norm
+
+    def _dfl(self, box_logits, tgt_ltrb):
+        # box_logits (n, 4*(rm+1)); tgt_ltrb (n,4) in cell units, clamped
+        dl = tgt_ltrb.clamp(0, self.reg_max - 0.01)
+        lo = dl.floor().long(); hi = lo + 1
+        wl = (hi.float() - dl); wr = (dl - lo.float())
+        logits = box_logits.reshape(-1, 4, self.reg_max + 1).reshape(-1, self.reg_max + 1)
+        lo = lo.reshape(-1); hi = hi.reshape(-1); wl = wl.reshape(-1); wr = wr.reshape(-1)
+        return (F.cross_entropy(logits, lo, reduction="none") * wl
+                + F.cross_entropy(logits, hi, reduction="none") * wr).reshape(-1, 4).mean(1)
+
+    def forward(self, preds, targets):
+        dev = preds[0].device
+        obj_l, cls_l, box_l, cxy, gw = self._flatten(preds)
+        B = obj_l.shape[0]
+        iou_fn = bbox_mpdiou if self.iou_type == "mpdiou" else None
+
+        L_obj = torch.zeros((), device=dev)
+        L_cls = torch.zeros((), device=dev)
+        L_box = torch.zeros((), device=dev)
+        L_dfl = torch.zeros((), device=dev)
+        total_norm = 0.0
+
+        for b in range(B):
+            gt = targets[b]["boxes"].to(dev)
+            obj_target = torch.zeros_like(obj_l[b])
+            if gt.numel():
+                gt_xyxy = torch.stack([gt[:, 0] - gt[:, 2] / 2, gt[:, 1] - gt[:, 3] / 2,
+                                       gt[:, 0] + gt[:, 2] / 2, gt[:, 1] + gt[:, 3] / 2], -1).clamp(0, 1)
+                with torch.no_grad():
+                    pxyxy = self._decode_xyxy(box_l[b], cxy, gw)
+                    scores = obj_l[b].sigmoid()
+                    fg, gt_idx, t_norm = self._assign(pxyxy, scores, gt_xyxy, cxy)
+                obj_target[fg] = t_norm[fg].to(obj_target.dtype)
+                if fg.any():
+                    w = t_norm[fg].clamp(min=1e-6)
+                    total_norm += float(w.sum())
+                    pb = self._decode_xyxy(box_l[b][fg], cxy[fg], gw[fg])
+                    tb = gt_xyxy[gt_idx[fg]]
+                    if iou_fn is None:
+                        iou = bbox_ciou(_xyxy_to_cxcywh(pb), _xyxy_to_cxcywh(tb)).clamp(-1, 1)
+                    else:
+                        iou = iou_fn(pb, tb).clamp(-1, 1)
+                    L_box = L_box + ((1.0 - iou) * w).sum()
+                    # DFL target: cell-centre -> GT edges, in cell units
+                    g = gw[fg]
+                    tl = torch.stack([(cxy[fg][:, 0] - tb[:, 0]) * g, (cxy[fg][:, 1] - tb[:, 1]) * g,
+                                      (tb[:, 2] - cxy[fg][:, 0]) * g, (tb[:, 3] - cxy[fg][:, 1]) * g], -1)
+                    L_dfl = L_dfl + (self._dfl(box_l[b][fg], tl) * w).sum()
+                    L_cls = L_cls + F.binary_cross_entropy_with_logits(
+                        cls_l[b][fg], torch.ones_like(cls_l[b][fg]), reduction="sum")
+
+            # Varifocal objectness over all cells
+            p = obj_l[b].sigmoid()
+            bce = F.binary_cross_entropy_with_logits(obj_l[b], obj_target, reduction="none")
+            weight = torch.where(obj_target > 0, obj_target,
+                                 self.vfl_alpha * p.pow(self.vfl_gamma))
+            L_obj = L_obj + (weight * bce).sum()
+
+        n = max(total_norm, 1.0)
+        n_pos = max(sum((t["boxes"].shape[0] for t in targets)), 1)
+        L_obj = L_obj / n
+        L_box = L_box / n
+        L_dfl = L_dfl / n
+        L_cls = L_cls / n
+
+        total = self.w_obj * L_obj + self.w_cls * L_cls + self.w_box * L_box + self.w_dfl * L_dfl
+        return total, {
+            "loss/total": total.item(),
+            "loss/cls": (self.w_obj * L_obj + self.w_cls * L_cls).item(),
+            "loss/box": (self.w_box * L_box + self.w_dfl * L_dfl).item(),
+        }

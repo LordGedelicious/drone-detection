@@ -127,3 +127,30 @@ def build_dataloaders(
             generator=torch.Generator().manual_seed(seed) if is_train else None,
         )
     return loaders
+
+
+def llrd_param_groups(model, base_lr: float, gamma: float, weight_decay: float = 1e-4):
+    """Discriminative (layer-wise) learning-rate groups for a warm-started model
+    (RefinedDetector / FinalDetector): backbone stages at ``base_lr * gamma**2``,
+    the neck at ``base_lr * gamma``, the new heads (+ SE, if present) at
+    ``base_lr``. Only ``requires_grad`` parameters are included, so it composes
+    with ``freeze_backbone``. (Discriminative fine-tuning, Howard & Ruder 2018.)
+    """
+    base = model.base
+    deep, neck = [], []
+    for name, mod in base.named_children():
+        ps = [q for q in mod.parameters() if q.requires_grad]
+        if not ps:
+            continue
+        (deep if name in ("stem", "stage2", "stage3", "stage4", "stage5") else neck).extend(ps)
+    head = [q for q in model.heads.parameters() if q.requires_grad]
+    if getattr(model, "se", None) is not None:
+        head += [q for q in model.se.parameters() if q.requires_grad]
+    n_grouped = len(deep) + len(neck) + len(head)
+    n_trainable = len([q for q in model.parameters() if q.requires_grad])
+    assert n_grouped == n_trainable, f"llrd grouping missed {n_trainable - n_grouped} tensors"
+    return [
+        {"params": deep, "lr": base_lr * gamma ** 2, "weight_decay": weight_decay},
+        {"params": neck, "lr": base_lr * gamma, "weight_decay": weight_decay},
+        {"params": head, "lr": base_lr, "weight_decay": weight_decay},
+    ]
