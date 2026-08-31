@@ -1,0 +1,28 @@
+# Orchestration for the training / evaluation jobs.
+#   docker compose build
+#   docker compose run --rm trainer train.py --model fpn --epochs 50
+#   docker compose run --rm trainer eval.py --weights checkpoints/fpn_best.pth --split test --profile
+#   WANDB_API_KEY=... docker compose run --rm trainer train.py --model p2
+
+services:
+  trainer:
+    build: .
+    image: drone-detection:latest
+    shm_size: "8gb"                       # DataLoader workers need shared memory
+    environment:
+      WANDB_API_KEY: ${WANDB_API_KEY:-}
+      WANDB_MODE: ${WANDB_MODE:-online}
+    volumes:
+      - ./data:/app/data
+      - ./checkpoints:/app/checkpoints
+      - ./runs:/app/runs
+      - ./wandb:/app/wandb
+      - ./splits:/app/splits
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: ["train.py", "--help"]
